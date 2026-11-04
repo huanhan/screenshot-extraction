@@ -29,7 +29,7 @@ import urllib.request
 import webbrowser
 from collections import namedtuple
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from PIL import Image, ImageGrab, ImageTk
 
@@ -42,6 +42,7 @@ LOG_PATH = os.path.join(APP_DIR, "log.txt")
 REQUEST_TIMEOUT = 120      # 单次请求最长等待秒数
 MAX_IMAGE_WIDTH = 2048     # 发送前缩放到的最大宽度
 AUTO_INTERVAL_SEC = 60     # 自动识别：有待处理截图时，每隔这么久检查一次
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 CGW_SITE = "https://img.cgwimg.com"          # cgwimg 站点（授权页与接口都在这里）
@@ -571,6 +572,8 @@ class App:
                                           foreground="#a33", cursor="hand2", command=self.clear_target)
         self.btn_clear_target.pack(side="left", padx=(4, 0))
         ttk.Button(bar, text="截图", command=self.capture).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="导入图片…", command=self.import_files).pack(side="left", padx=6)
+        ttk.Button(bar, text="粘贴图片", command=self.paste_images).pack(side="left")
         ttk.Button(bar, text="删除选中", command=self.delete_selected).pack(side="left", padx=6)
         ttk.Button(bar, text="清空", command=self.clear_shots).pack(side="left")
 
@@ -587,6 +590,8 @@ class App:
         self.shot_tree.pack(fill="y")
         self.shot_tree.bind("<<TreeviewSelect>>", self.on_shot_select)
         self.shot_tree.bind("<Double-1>", self.on_shot_double)
+        # Ctrl+V 在截图页且剪贴板有图片时导入；没有图片就不拦截，文本粘贴照常工作
+        self.root.bind_all("<Control-v>", self.on_ctrl_v, add="+")
 
         self.preview = ttk.Label(body, anchor="center", text="选中截图预览；双击放大查看",
                                  foreground="#888", cursor="hand2")
@@ -785,12 +790,81 @@ class App:
         what = f"窗口「{target.title[:30]}」" if target else "全屏"
         self.say(f"已截取{what}，共 {len(self.shots)} 张。")
 
-    def add_shot(self, path):
+    def on_ctrl_v(self, event):
+        """只在「截图」页、焦点不在文本输入控件时，且剪贴板确实有图片时才接管 Ctrl+V。"""
+        if self.nb.select() != str(self.tab_shots):
+            return None
+        if event.widget.winfo_class() in ("Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"):
+            return None
+        try:
+            data = ImageGrab.grabclipboard()
+        except Exception:
+            return None
+        if data is None:
+            return None               # 剪贴板不是图片，交给系统默认粘贴
+        self.paste_images()
+        return "break"
+
+    def import_files(self):
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="选择要导入的图片（可多选）",
+            filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp *.webp *.gif"), ("所有文件", "*.*")])
+        if paths:
+            self._import_paths(list(paths))
+
+    def paste_images(self):
+        """粘贴：剪贴板里是图片，或是资源管理器里复制的图片文件。没有图片时不做任何事。"""
+        try:
+            data = ImageGrab.grabclipboard()
+        except Exception as e:
+            log("grabclipboard failed:\n" + traceback.format_exc())
+            return self.say("读取剪贴板失败：" + str(e))
+        if data is None:
+            return self.say("剪贴板里没有图片。")
+        if isinstance(data, list):
+            paths = [p for p in data if isinstance(p, str)]
+            return self._import_paths(paths) if paths else self.say("剪贴板里没有图片。")
+        path = save_shot(data.convert("RGB"), "paste")
+        self.add_shot(path, refresh=False)
+        self._after_import(added=1, failed=[])
+
+    def _import_paths(self, paths):
+        added, failed = 0, []
+        for src in paths:
+            if os.path.splitext(src)[1].lower() not in IMAGE_EXTS:
+                failed.append(os.path.basename(src) + "（不是图片）")
+                continue
+            try:
+                with Image.open(src) as im:
+                    im.load()
+                    img = im.convert("RGB")
+                path = save_shot(img, "import")
+                self.add_shot(path, refresh=False)
+                added += 1
+            except Exception as e:
+                log("import failed: " + src + "\n" + traceback.format_exc())
+                failed.append(f"{os.path.basename(src)}（{e}）")
+        self._after_import(added, failed)
+
+    def _after_import(self, added, failed):
+        self.refresh_shots()
+        if self.shots:
+            self.shot_tree.selection_set(str(self.shots[-1]["id"]))
+            self.shot_tree.see(str(self.shots[-1]["id"]))
+        self.nb.select(self.tab_shots)
+        msg = f"已导入 {added} 张，共 {len(self.shots)} 张。" if added else "没有导入任何图片。"
+        if failed:
+            msg += " 失败 " + str(len(failed)) + " 个：" + "；".join(failed[:3])
+        self.say(msg)
+
+    def add_shot(self, path, refresh=True):
         with Image.open(path) as im:
             size = f"{im.width} × {im.height}"
         self.shots.append({"id": self._next_id, "path": path, "time": time.strftime("%H:%M:%S"),
                            "size": size, "state": "待识别", "rows": [], "cols": [], "msg": ""})
         self._next_id += 1
+        if not refresh:
+            return
         self.refresh_shots()
         self.shot_tree.selection_set(str(self.shots[-1]["id"]))
         self.shot_tree.see(str(self.shots[-1]["id"]))
