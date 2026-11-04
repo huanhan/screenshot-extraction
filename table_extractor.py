@@ -565,6 +565,7 @@ class App:
         self.auth_thread = None
         self.auth_cancel = threading.Event()
         self.auth_status = None     # 设置窗口里「授权状态」的 StringVar，窗口打开时才有
+        self.settings_win = None    # 设置窗口打开期间为 True，全局热键暂停，避免录制时误触发截图/粘贴
 
         root.title(APP_NAME)
         root.geometry("1120x700")
@@ -760,6 +761,8 @@ class App:
 
     def handle(self, ev):
         kind = ev[0]
+        if kind.startswith("hotkey_") and self.settings_win is not None:
+            return                      # 设置窗口打开时忽略热键（防止关闭前已排队的事件生效）
         if kind == "hotkey_capture":
             self.capture()
         elif kind == "hotkey_paste":
@@ -1495,6 +1498,18 @@ class App:
         frm.columnconfigure(1, weight=1)
         vars_ = {}
 
+        # 打开设置时先注销全局热键：否则按旧快捷键会直接截图，而且录制新快捷键时会被系统吞掉。
+        # 关闭（保存、取消或点 ×）时按已保存的设置重新注册；取消时就恢复到原来的快捷键。
+        self.settings_win = win
+        self.stop_hotkeys()
+
+        def close_settings():
+            self.settings_win = None
+            self.start_hotkeys()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close_settings)
+
         def field(row, label, key, hint, show=""):
             ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=(6, 0))
             var = tk.StringVar(value=str(s[key]))
@@ -1683,11 +1698,12 @@ class App:
             self.refresh_results()
             if self.hk and not self.hk.error:
                 self.say("设置已保存，快捷键已生效")
+            self.settings_win = None
             win.destroy()
 
         btns = ttk.Frame(frm)
         btns.grid(row=14, column=0, columnspan=2, sticky="e", pady=(14, 0))
-        ttk.Button(btns, text="取消", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="取消", command=close_settings).pack(side="right")
         ttk.Button(btns, text="保存", command=save).pack(side="right", padx=6)
 
     def on_close(self):
