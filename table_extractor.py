@@ -561,13 +561,18 @@ class App:
     def build_shots_tab(self):
         bar = ttk.Frame(self.tab_shots)
         bar.pack(fill="x", pady=(0, 8))
-        ttk.Button(bar, text="立即截图", command=self.capture).pack(side="left")
-        ttk.Button(bar, text="指定截图窗口…", command=self.pick_window).pack(side="left", padx=6)
-        ttk.Button(bar, text="恢复全屏", command=self.clear_target).pack(side="left")
+        ttk.Button(bar, text="选择窗口…", command=self.pick_window).pack(side="left")
+        # 截图范围：默认全屏；选了窗口后显示窗口名，右侧 ✕ 点击即恢复全屏
+        scope = ttk.Frame(bar)
+        scope.pack(side="left", padx=(8, 0))
+        self.lbl_mode = ttk.Label(scope)
+        self.lbl_mode.pack(side="left")
+        self.btn_clear_target = tk.Button(scope, text="✕", relief="flat", borderwidth=0, padx=4, pady=0,
+                                          foreground="#a33", cursor="hand2", command=self.clear_target)
+        self.btn_clear_target.pack(side="left", padx=(4, 0))
+        ttk.Button(bar, text="截图", command=self.capture).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="删除选中", command=self.delete_selected).pack(side="left", padx=6)
         ttk.Button(bar, text="清空", command=self.clear_shots).pack(side="left")
-        self.lbl_mode = ttk.Label(bar)
-        self.lbl_mode.pack(side="left", padx=12)
 
         body = ttk.Frame(self.tab_shots)
         body.pack(fill="both", expand=True)
@@ -809,7 +814,7 @@ class App:
         dlg.title("选择要截取的窗口")
         dlg.transient(self.root)
         dlg.geometry("640x420")
-        ttk.Label(dlg, text="选中一个窗口后点「指定」。之后截图都只截这个窗口，窗口会被置于最前。",
+        ttk.Label(dlg, text="选中一个窗口后点「选择」。之后截图都只截这个窗口，窗口会被置于最前。",
                   padding=(10, 8)).pack(anchor="w")
         frm = ttk.Frame(dlg, padding=(10, 0))
         frm.pack(fill="both", expand=True)
@@ -840,7 +845,7 @@ class App:
         btns = ttk.Frame(dlg, padding=10)
         btns.pack(fill="x")
         ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right")
-        ttk.Button(btns, text="指定", command=take).pack(side="right", padx=6)
+        ttk.Button(btns, text="选择", command=take).pack(side="right", padx=6)
         tree.bind("<Double-1>", take)
         dlg.grab_set()
 
@@ -856,9 +861,11 @@ class App:
 
     def update_mode(self):
         if self.target:
-            self.lbl_mode.config(text=f"截图范围：窗口「{self.target.title[:30]}」", foreground="#0a6")
+            self.lbl_mode.config(text=f"窗口：{self.target.title[:30]}", foreground="#0a6")
+            self.btn_clear_target.pack(side="left", padx=(4, 0))
         else:
-            self.lbl_mode.config(text="截图范围：全屏", foreground="#666")
+            self.lbl_mode.config(text="全屏", foreground="#666")
+            self.btn_clear_target.pack_forget()
 
     def selected_shot_ids(self):
         return [int(i) for i in self.shot_tree.selection()]
