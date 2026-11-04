@@ -118,12 +118,23 @@ _KEYSYM_TO_NAME = {
 }
 
 
-def hotkey_from_event(event):
+_MODIFIER_KEYSYMS = {
+    "Control_L": "ctrl", "Control_R": "ctrl",
+    "Shift_L": "shift", "Shift_R": "shift",
+    "Alt_L": "alt", "Alt_R": "alt",
+    "Win_L": "win", "Win_R": "win", "Meta_L": "win", "Meta_R": "win", "Super_L": "win", "Super_R": "win",
+}
+_MOD_ORDER = ["ctrl", "alt", "shift", "win"]
+
+
+def hotkey_from_event(event, held):
     """把 tkinter 按键事件转成 parse_hotkey 认识的文本，如 'ctrl+shift+r'。
+
+    修饰键不看 event.state 的位（Windows 上 tk 的位定义不可靠，会把 Ctrl 误报成 Alt），
+    而是用 held：一个集合，由录制框根据修饰键的按下/松开事件维护。
     只有修饰键、或无法识别的键时返回 None（表示还没录到有效组合）。"""
     sym = event.keysym
-    if sym in ("Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R",
-               "Win_L", "Win_R", "Meta_L", "Meta_R", "Super_L", "Super_R"):
+    if sym in _MODIFIER_KEYSYMS:
         return None
     if re.fullmatch(r"[a-zA-Z0-9]", sym):
         key = sym.lower()
@@ -133,16 +144,7 @@ def hotkey_from_event(event):
         key = _KEYSYM_TO_NAME[sym]
     else:
         return None
-    state = event.state
-    mods = []
-    if state & 0x0004:
-        mods.append("ctrl")
-    if state & 0x0008 or state & 0x0080:    # Alt（Mod1）
-        mods.append("alt")
-    if state & 0x0001:
-        mods.append("shift")
-    if state & 0x0040 or state & 0x0100:    # Win 键在 tk 下常映射为 Mod4/Mod5，视平台而定
-        mods.append("win")
+    mods = [m for m in _MOD_ORDER if m in held]
     if not mods:
         return None
     return "+".join(mods + [key])
@@ -1509,28 +1511,33 @@ class App:
                            readonlybackground="#fff")
             box.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=(6, 0))
             ttk.Label(frm, text=hint, foreground="#888").grid(row=row + 1, column=1, sticky="w", padx=(10, 0))
-            state = {"prev": str(s[key]), "recording": False}
+            # held：当前按住的修饰键，由 KeyPress/KeyRelease 维护，不依赖 event.state 的位
+            state = {"prev": str(s[key]), "recording": False, "held": set()}
 
             def start(_=None):
                 if not state["recording"]:          # 连续点击时不能把提示文字当成原值
                     state["prev"] = var.get()
                 state["recording"] = True
+                state["held"] = set()
                 box.config(state="normal")
                 var.set("请按下组合键…（Esc 取消）")
                 box.config(state="readonly")
                 box.focus_set()
                 return "break"
 
-            def on_key(event):
+            def on_press(event):
                 if not state["recording"]:
+                    return "break"
+                if event.keysym in _MODIFIER_KEYSYMS:
+                    state["held"].add(_MODIFIER_KEYSYMS[event.keysym])
                     return "break"
                 if event.keysym == "Escape":
                     var.set(state["prev"])
                     state["recording"] = False
                     return "break"
-                text = hotkey_from_event(event)
+                text = hotkey_from_event(event, state["held"])
                 if text is None:
-                    return "break"              # 只按了修饰键，继续等
+                    return "break"              # 没有修饰键或无法识别的键，继续等
                 try:
                     parse_hotkey(text)          # 与保存时的校验一致
                 except ValueError:
@@ -1541,8 +1548,14 @@ class App:
                 state["recording"] = False
                 return "break"
 
+            def on_release(event):
+                if event.keysym in _MODIFIER_KEYSYMS:
+                    state["held"].discard(_MODIFIER_KEYSYMS[event.keysym])
+                return "break"
+
             box.bind("<Button-1>", start)
-            box.bind("<KeyPress>", on_key)
+            box.bind("<KeyPress>", on_press)
+            box.bind("<KeyRelease>", on_release)
             box.bind("<FocusOut>", lambda e: (state.update(recording=False),
                                                var.set(state["prev"]) if var.get().startswith("请按下") else None))
             vars_[key] = var
