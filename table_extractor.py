@@ -48,6 +48,7 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 CGW_SITE = "https://img.cgwimg.com"          # cgwimg 站点（授权页与接口都在这里）
 CGW_BASE_URL = CGW_SITE + "/api/v1"          # OpenAI 兼容接口地址
 CGW_APP_ID = "screenshot-extraction"         # 在 cgwimg 后台登记的应用 ID
+CGW_MODEL = "gpt-6.1-sol"                    # cgwimg 方式固定使用的模型
 PROVIDER_CUSTOM, PROVIDER_CGW = "custom", "cgwimg"
 PROVIDER_LABELS = {PROVIDER_CUSTOM: "自定义（OpenAI 兼容接口）",
                    PROVIDER_CGW: "cgwimg（授权登录，无需 Key）"}
@@ -109,6 +110,43 @@ def parse_columns(text):
 
 
 # ---------------------------------------------------------------- 快捷键
+
+_KEYSYM_TO_NAME = {
+    "space": "space", "Tab": "tab", "Return": "enter", "KP_Enter": "enter", "Escape": "esc",
+    "Insert": "insert", "Delete": "delete", "Home": "home", "End": "end",
+    "Prior": "pageup", "Next": "pagedown",
+}
+
+
+def hotkey_from_event(event):
+    """把 tkinter 按键事件转成 parse_hotkey 认识的文本，如 'ctrl+shift+r'。
+    只有修饰键、或无法识别的键时返回 None（表示还没录到有效组合）。"""
+    sym = event.keysym
+    if sym in ("Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R",
+               "Win_L", "Win_R", "Meta_L", "Meta_R", "Super_L", "Super_R"):
+        return None
+    if re.fullmatch(r"[a-zA-Z0-9]", sym):
+        key = sym.lower()
+    elif re.fullmatch(r"F([1-9]|1[0-2])", sym):
+        key = sym.lower()
+    elif sym in _KEYSYM_TO_NAME:
+        key = _KEYSYM_TO_NAME[sym]
+    else:
+        return None
+    state = event.state
+    mods = []
+    if state & 0x0004:
+        mods.append("ctrl")
+    if state & 0x0008 or state & 0x0080:    # Alt（Mod1）
+        mods.append("alt")
+    if state & 0x0001:
+        mods.append("shift")
+    if state & 0x0040 or state & 0x0100:    # Win 键在 tk 下常映射为 Mod4/Mod5，视平台而定
+        mods.append("win")
+    if not mods:
+        return None
+    return "+".join(mods + [key])
+
 
 def parse_hotkey(text):
     """'ctrl+shift+r' -> (修饰键位掩码, 虚拟键码)。格式不对抛 ValueError。"""
@@ -1463,8 +1501,55 @@ class App:
             ttk.Label(frm, text=hint, foreground="#888").grid(row=row + 1, column=1, sticky="w", padx=(10, 0))
             vars_[key] = var
 
-        field(0, "截图快捷键", "recognize_hotkey", "全屏或指定窗口截图，例如 ctrl+shift+r")
-        field(2, "粘贴快捷键", "paste_hotkey", "复制模式下粘贴下一个单元格，例如 ctrl+shift+v")
+        def hotkey_field(row, label, key, hint):
+            """按键录制框：点一下后直接按组合键即可，Esc 取消。文本不可手输。"""
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=(6, 0))
+            var = tk.StringVar(value=str(s[key]))
+            box = tk.Entry(frm, textvariable=var, width=56, state="readonly", cursor="hand2",
+                           readonlybackground="#fff")
+            box.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=(6, 0))
+            ttk.Label(frm, text=hint, foreground="#888").grid(row=row + 1, column=1, sticky="w", padx=(10, 0))
+            state = {"prev": str(s[key]), "recording": False}
+
+            def start(_=None):
+                if not state["recording"]:          # 连续点击时不能把提示文字当成原值
+                    state["prev"] = var.get()
+                state["recording"] = True
+                box.config(state="normal")
+                var.set("请按下组合键…（Esc 取消）")
+                box.config(state="readonly")
+                box.focus_set()
+                return "break"
+
+            def on_key(event):
+                if not state["recording"]:
+                    return "break"
+                if event.keysym == "Escape":
+                    var.set(state["prev"])
+                    state["recording"] = False
+                    return "break"
+                text = hotkey_from_event(event)
+                if text is None:
+                    return "break"              # 只按了修饰键，继续等
+                try:
+                    parse_hotkey(text)          # 与保存时的校验一致
+                except ValueError:
+                    var.set("该按键组合不可用，请换一个")
+                    state["recording"] = False
+                    return "break"
+                var.set(text)
+                state["recording"] = False
+                return "break"
+
+            box.bind("<Button-1>", start)
+            box.bind("<KeyPress>", on_key)
+            box.bind("<FocusOut>", lambda e: (state.update(recording=False),
+                                               var.set(state["prev"]) if var.get().startswith("请按下") else None))
+            vars_[key] = var
+            return var
+
+        hotkey_field(0, "截图快捷键", "recognize_hotkey", "点击输入框后直接按组合键，例如 Ctrl+Shift+R")
+        hotkey_field(2, "粘贴快捷键", "paste_hotkey", "点击输入框后直接按组合键，例如 Ctrl+Shift+V")
 
         # ---- 接口来源
         ttk.Label(frm, text="接口来源").grid(row=4, column=0, sticky="w", pady=(10, 0))
@@ -1486,6 +1571,14 @@ class App:
                 row=r * 2, column=1, sticky="ew", padx=(10, 0), pady=(6, 0))
             ttk.Label(custom, text=hint, foreground="#888").grid(row=r * 2 + 1, column=1, sticky="w", padx=(10, 0))
             vars_[key] = var
+        # 模型名称只属于自定义接口；cgwimg 方式固定使用 CGW_MODEL，界面不显示
+        ttk.Label(custom, text="模型名称").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        model_var = tk.StringVar(value=str(s["model"]))
+        ttk.Entry(custom, textvariable=model_var, width=56).grid(
+            row=4, column=1, sticky="ew", padx=(10, 0), pady=(6, 0))
+        ttk.Label(custom, text="需支持图片输入的模型，例如 gpt-4o", foreground="#888").grid(
+            row=5, column=1, sticky="w", padx=(10, 0))
+        vars_["model"] = model_var
 
         # cgwimg：授权登录
         cgw = ttk.Frame(frm)
@@ -1537,7 +1630,6 @@ class App:
         combo.bind("<<ComboboxSelected>>", on_provider)
         on_provider()
 
-        field(6, "模型名称", "model", "需支持图片输入的模型，例如 gpt-4o")
         field(8, "提取格式（列名）", "columns", "用逗号分隔，例如：项目,数量,单价。留空则按截图表头自动识别")
         field(10, "图片 WebP 质量", "webp_quality", "1-100，默认 85")
 
@@ -1554,6 +1646,8 @@ class App:
                 new[k] = var.get().strip()
             new["provider"] = (PROVIDER_CGW if prov_var.get() == PROVIDER_LABELS[PROVIDER_CGW]
                                else PROVIDER_CUSTOM)
+            if new["provider"] == PROVIDER_CGW:
+                new["model"] = CGW_MODEL          # cgwimg 固定模型，不接受界面输入
             new["extra_prompt"] = extra.get("1.0", "end").strip()
             try:
                 rk = parse_hotkey(new["recognize_hotkey"])
@@ -1564,6 +1658,8 @@ class App:
                 return messagebox.showerror("设置有误", "截图快捷键和粘贴快捷键不能相同", parent=win)
             if new["provider"] == PROVIDER_CGW and not str(new.get("cgw_key", "")).strip():
                 return messagebox.showerror("设置有误", "请先点「授权登录」完成 cgwimg 授权", parent=win)
+            if new["provider"] == PROVIDER_CUSTOM and not str(new.get("model", "")).strip():
+                return messagebox.showerror("设置有误", "请填写模型名称", parent=win)
             new["recognize_hotkey"] = new["recognize_hotkey"].lower()
             new["paste_hotkey"] = new["paste_hotkey"].lower()
             new["webp_quality"] = clamp_int(new["webp_quality"], 1, 100, 85)
