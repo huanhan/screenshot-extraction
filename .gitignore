@@ -1,0 +1,12 @@
+# 不提交的文件
+*.md
+!README.md
+
+# Python / 构建产物
+__pycache__/
+*.pyc
+build/
+*.spec
+
+# 打包产物（exe 不进仓库，本地 dist 目录自行保留）
+dist/
