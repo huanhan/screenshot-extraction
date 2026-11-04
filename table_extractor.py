@@ -1,535 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-截图表格提取工具（Windows）
+截图表格提取工具（Windows）—— 界面层。
 
-数据模型：每张截图是一条记录，识别结果挂在来源截图上。
-- 「截图」页：全屏/指定窗口截图，列表预览，双击放大查看。
-- 「识别结果」页：结果表每行记录来源截图；点击行显示对应截图，同一张图的行用颜色成组；
-  重复内容打标识。
-- 识别方式：手动「识别待处理」/「重新识别」，或开启「自动识别」（攒够 N 张或每分钟检查一次）。
-- 复制模式：粘贴快捷键按行优先顺序粘贴下一个未填单元格；已粘贴/已跳过/空单元格自动跳过。
+业务逻辑分在同目录的模块里：
+- app_config.py：路径、设置读写、日志
+- hotkeys.py：全局快捷键、粘贴按键
+- capture.py：全屏/窗口截图
+- recognize.py：WebP 转换、接口调用、表格解析、后台识别线程
+- cgw_auth.py：cgwimg 授权登录
+- model.py：结果表的纯数据逻辑
 
-发送给模型的图片先转 WebP。依赖：pip install pillow（tkinter 随 Python 自带）。
+界面分两个标签页：
+- 「截图」：顶部工具栏（选择窗口 / 截图 / 导入图片 / 清空截图），左侧截图列表（右键可删除），右侧原图（双击放大）。
+- 「识别结果」：识别操作、粘贴模式，左侧结果表，右侧详细。
+
+依赖：pip install pillow（tkinter 随 Python 自带）。
 """
 
-import base64
 import ctypes
-import ctypes.wintypes as wt
-import io
-import json
 import os
 import queue
-import re
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.parse
-import urllib.request
-import webbrowser
-from collections import namedtuple
 import tkinter as tk
+import webbrowser
 from tkinter import ttk, messagebox, filedialog
 
 from PIL import Image, ImageGrab, ImageTk
 
-APP_NAME = "截图表格提取"
-APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ScreenshotExtract")
-SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
-SHOT_DIR = os.path.join(APP_DIR, "shots")
-LOG_PATH = os.path.join(APP_DIR, "log.txt")
-
-REQUEST_TIMEOUT = 120      # 单次请求最长等待秒数
-MAX_IMAGE_WIDTH = 2048     # 发送前缩放到的最大宽度
-AUTO_INTERVAL_SEC = 60     # 自动识别：有待处理截图时，每隔这么久检查一次
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
-BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-CGW_SITE = "https://img.cgwimg.com"          # cgwimg 站点（授权页与接口都在这里）
-CGW_BASE_URL = CGW_SITE + "/api/v1"          # OpenAI 兼容接口地址
-CGW_APP_ID = "screenshot-extraction"         # 在 cgwimg 后台登记的应用 ID
-CGW_MODEL = "gpt-6.1-sol"                    # cgwimg 方式固定使用的模型
-PROVIDER_CUSTOM, PROVIDER_CGW = "custom", "cgwimg"
-PROVIDER_LABELS = {PROVIDER_CUSTOM: "自定义（OpenAI 兼容接口）",
-                   PROVIDER_CGW: "cgwimg（授权登录，无需 Key）"}
-
-DEFAULT_SETTINGS = {
-    "recognize_hotkey": "ctrl+shift+r",   # 截图快捷键
-    "paste_hotkey": "ctrl+shift+v",       # 复制模式下粘贴下一个单元格
-    "provider": PROVIDER_CGW,     # custom: 自填 Base URL + API Key；cgwimg: 授权登录获取 cgw_key
-    "cgw_key": "",                # cgwimg 授权后拿到的 Key（只在本机保存）
-    "base_url": "https://api.openai.com/v1",
-    "api_key": "",
-    "model": "gpt-4o",
-    "columns": "",          # 提取格式：列名，逗号分隔；留空则按截图表头
-    "extra_prompt": "",     # 额外的提取要求
-    "batch_size": 3,        # 每次请求最多合并几张图
-    "webp_quality": 85,
-}
-
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-
-MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
-WM_HOTKEY = 0x0312
-WM_QUIT = 0x0012
-KEYEVENTF_KEYUP = 0x0002
-VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_V = 0x11, 0x12, 0x10, 0x5B, 0x5C, 0x56
-_SPECIAL_KEYS = {
-    "space": 0x20, "tab": 0x09, "enter": 0x0D, "esc": 0x1B, "insert": 0x2D, "delete": 0x2E,
-    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
-}
+from app_config import (APP_NAME, AUTO_INTERVAL_SEC, CGW_MODEL, IMAGE_EXTS, LOG_PATH, PROVIDER_CGW,
+                        PROVIDER_CUSTOM, PROVIDER_LABELS, clamp_int, is_configured, load_settings, log,
+                        one_line, parse_columns, save_settings)
+from capture import capture_screen, capture_window, list_windows, save_shot, window_alive
+from cgw_auth import AuthThread
+from hotkeys import (_MODIFIER_KEYSYMS, HotkeyThread, hotkey_from_event, parse_hotkey, send_ctrl_v,
+                     wait_modifiers_released)
+from model import reindex_done, row_key
+from recognize import BatchWorker, chunk
 
 # 同一张图里的行用这些颜色成组（浅色底，便于看清）
 GROUP_COLORS = ["#e8f1ff", "#fff4e0", "#e9f8ee", "#f6e9ff", "#ffe9ea", "#e6f7f9"]
-
-
-def log(msg):
-    try:
-        os.makedirs(APP_DIR, exist_ok=True)
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
-    except OSError:
-        pass
-
-
-def clamp_int(v, lo, hi, default):
-    try:
-        return min(max(int(v), lo), hi)
-    except (TypeError, ValueError):
-        return default
-
-
-def one_line(text):
-    """把多行文本压成一行显示，换行处用「↵」标出。"""
-    return re.sub(r"[ \t]*(\r\n|\r|\n)[ \t]*", " ↵ ", str(text or "")).strip()
-
-
-def parse_columns(text):
-    return [c.strip() for c in re.split(r"[,，、\n]", text or "") if c.strip()]
-
-
-# ---------------------------------------------------------------- 快捷键
-
-_KEYSYM_TO_NAME = {
-    "space": "space", "Tab": "tab", "Return": "enter", "KP_Enter": "enter", "Escape": "esc",
-    "Insert": "insert", "Delete": "delete", "Home": "home", "End": "end",
-    "Prior": "pageup", "Next": "pagedown",
-}
-
-
-_MODIFIER_KEYSYMS = {
-    "Control_L": "ctrl", "Control_R": "ctrl",
-    "Shift_L": "shift", "Shift_R": "shift",
-    "Alt_L": "alt", "Alt_R": "alt",
-    "Win_L": "win", "Win_R": "win", "Meta_L": "win", "Meta_R": "win", "Super_L": "win", "Super_R": "win",
-}
-_MOD_ORDER = ["ctrl", "alt", "shift", "win"]
-
-
-def hotkey_from_event(event, held):
-    """把 tkinter 按键事件转成 parse_hotkey 认识的文本，如 'ctrl+shift+r'。
-
-    修饰键不看 event.state 的位（Windows 上 tk 的位定义不可靠，会把 Ctrl 误报成 Alt），
-    而是用 held：一个集合，由录制框根据修饰键的按下/松开事件维护。
-    只有修饰键、或无法识别的键时返回 None（表示还没录到有效组合）。"""
-    sym = event.keysym
-    if sym in _MODIFIER_KEYSYMS:
-        return None
-    if re.fullmatch(r"[a-zA-Z0-9]", sym):
-        key = sym.lower()
-    elif re.fullmatch(r"F([1-9]|1[0-2])", sym):
-        key = sym.lower()
-    elif sym in _KEYSYM_TO_NAME:
-        key = _KEYSYM_TO_NAME[sym]
-    else:
-        return None
-    mods = [m for m in _MOD_ORDER if m in held]
-    if not mods:
-        return None
-    return "+".join(mods + [key])
-
-
-def parse_hotkey(text):
-    """'ctrl+shift+r' -> (修饰键位掩码, 虚拟键码)。格式不对抛 ValueError。"""
-    parts = [p.strip().lower() for p in text.split("+") if p.strip()]
-    if not parts:
-        raise ValueError("快捷键不能为空")
-    mods, key = 0, None
-    for p in parts:
-        if p in ("ctrl", "control"):
-            mods |= MOD_CONTROL
-        elif p == "alt":
-            mods |= MOD_ALT
-        elif p == "shift":
-            mods |= MOD_SHIFT
-        elif p in ("win", "windows"):
-            mods |= MOD_WIN
-        elif key is not None:
-            raise ValueError(f"快捷键只能包含一个普通键：{text}")
-        elif len(p) == 1 and p.isalnum():
-            key = ord(p.upper())
-        elif re.fullmatch(r"f([1-9]|1[0-2])", p):
-            key = 0x70 + int(p[1:]) - 1
-        elif p in _SPECIAL_KEYS:
-            key = _SPECIAL_KEYS[p]
-        else:
-            raise ValueError(f"不认识的按键：{p}")
-    if key is None:
-        raise ValueError(f"快捷键需要一个普通键，例如 ctrl+shift+r：{text}")
-    if mods == 0:
-        raise ValueError(f"快捷键需要至少一个修饰键（Ctrl/Alt/Shift/Win）：{text}")
-    return mods, key
-
-
-class HotkeyThread(threading.Thread):
-    """独立线程注册全局热键并跑消息循环，触发时把事件放进队列。"""
-
-    def __init__(self, bindings, events):
-        super().__init__(daemon=True)
-        self.bindings = bindings
-        self.events = events
-        self.thread_id = None
-        self.error = ""
-        self.ready = threading.Event()
-
-    def run(self):
-        self.thread_id = kernel32.GetCurrentThreadId()
-        ids = {}
-        for i, (name, (mods, key)) in enumerate(self.bindings.items(), start=1):
-            if user32.RegisterHotKey(None, i, mods | MOD_NOREPEAT, key):
-                ids[i] = name
-            else:
-                err = kernel32.GetLastError()
-                why = "已被其他程序占用" if err == 1409 else f"错误码 {err}"
-                self.error += f"快捷键 {name} 无法注册（{why}），请在设置里换一个。  "
-        self.ready.set()
-        msg = wt.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_HOTKEY and msg.wParam in ids:
-                self.events.put(("hotkey_" + ids[msg.wParam],))
-        for i in ids:
-            user32.UnregisterHotKey(None, i)
-
-
-def wait_modifiers_released(timeout=2.0):
-    vks = (VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN)
-    end = time.time() + timeout
-    while time.time() < end:
-        if not any(user32.GetAsyncKeyState(v) & 0x8000 for v in vks):
-            return True
-        time.sleep(0.02)
-    return False
-
-
-def send_ctrl_v():
-    # 超时仍按着 Alt/Shift/Win 时先强制松开，保证发出的是普通 Ctrl+V
-    for vk in (VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN):
-        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-    user32.keybd_event(VK_CONTROL, 0, 0, 0)
-    user32.keybd_event(VK_V, 0, 0, 0)
-    user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-
-
-# ---------------------------------------------------------------- 截图
-
-WindowInfo = namedtuple("WindowInfo", "hwnd title rect")   # rect = (left, top, right, bottom)
-EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-DWMWA_EXTENDED_FRAME_BOUNDS = 9
-
-
-def capture_screen():
-    img = ImageGrab.grab(all_screens=True).convert("RGB")
-    return save_shot(img, "shot")
-
-
-def save_shot(img, prefix):
-    os.makedirs(SHOT_DIR, exist_ok=True)
-    name = time.strftime(f"{prefix}_%Y%m%d_%H%M%S_") + f"{time.time_ns() % 1000000:06d}.png"
-    path = os.path.join(SHOT_DIR, name)
-    img.save(path, "PNG")
-    return path
-
-
-def list_windows(own_hwnd=None):
-    """列出可见的、有标题的顶层窗口，排除本程序自己的窗口。"""
-    result = []
-
-    def cb(hwnd, _):
-        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
-            return True
-        n = user32.GetWindowTextLengthW(hwnd)
-        if n == 0:
-            return True
-        buf = ctypes.create_unicode_buffer(n + 1)
-        user32.GetWindowTextW(hwnd, buf, n + 1)
-        title = buf.value.strip()
-        if not title or hwnd == own_hwnd:
-            return True
-        result.append(WindowInfo(hwnd, title, window_rect(hwnd)))
-        return True
-
-    user32.EnumWindows(EnumWindowsProc(cb), 0)
-    return [w for w in result if w.rect and w.rect[2] - w.rect[0] > 50 and w.rect[3] - w.rect[1] > 50]
-
-
-def window_rect(hwnd):
-    """优先用 DWM 真实边界（不含阴影边框），失败退回 GetWindowRect。"""
-    r = wt.RECT()
-    try:
-        ok = ctypes.windll.dwmapi.DwmGetWindowAttribute(
-            hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r)) == 0
-    except OSError:
-        ok = False
-    if not ok and not user32.GetWindowRect(hwnd, ctypes.byref(r)):
-        return None
-    return (r.left, r.top, r.right, r.bottom)
-
-
-def capture_window(info):
-    hwnd = info.hwnd
-    if not user32.IsWindow(hwnd):
-        raise RuntimeError("窗口已经关闭")
-    if user32.IsIconic(hwnd):
-        raise RuntimeError("窗口已最小化，请先还原它")
-    user32.SetForegroundWindow(hwnd)     # 不调用 ShowWindow，避免改动用户窗口的大小状态
-    time.sleep(0.35)
-    rect = window_rect(hwnd)
-    if not rect:
-        raise RuntimeError("无法获取窗口位置")
-    left, top, right, bottom = rect
-    img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True).convert("RGB")
-    return save_shot(img, "win")
-
-
-# ---------------------------------------------------------------- 识别
-
-def image_to_webp_b64(path, quality):
-    with Image.open(path) as im:
-        img = im.convert("RGB")
-    if img.width > MAX_IMAGE_WIDTH:
-        h = round(img.height * MAX_IMAGE_WIDTH / img.width)
-        img = img.resize((MAX_IMAGE_WIDTH, h), Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, "WEBP", quality=quality, method=4)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def build_prompt(columns, extra, n_images):
-    if columns:
-        fmt = f"每一行输出一个对象，键必须严格为这些列名（按此顺序）：{json.dumps(columns, ensure_ascii=False)}。"
-    else:
-        fmt = "每一行输出一个对象，键为截图表头中的列名。"
-    p = (f"你是表格提取助手。下面共 {n_images} 张图片，请识别其中的表格并提取全部数据行。"
-         "如果是同一张表的不同部分，相邻图片可能有重叠的行：每张图的行都要完整输出，不要去重（重复由程序标注）。"
-         "每一行必须额外包含字段 \"_img\"，值为该行所在图片的编号（整数，从 1 开始）。"
-         "按图片顺序和表内顺序输出。"
-         + fmt +
-         "单元格没有内容时填空字符串。保持原文，不要编造，不要遗漏行。"
-         "只输出 JSON，格式为 {\"rows\": [ {...}, {...} ]}，不要输出其他文字或代码块标记。")
-    if extra.strip():
-        p += "\n额外要求：" + extra.strip()
-    return p
-
-
-def http_error_hint(code, body):
-    body = body[:300]
-    if code == 401:
-        hint = "API Key 无效或已过期，请检查设置里的 API Key。"
-    elif code == 403:
-        hint = ("被服务端拒绝（403）。可能是：Key 没有该模型的权限、账户余额不足、"
-                "或网关拦截了请求。请核对模型名称和 Key 权限。")
-    elif code == 404:
-        hint = "接口或模型不存在（404），请检查 Base URL 和模型名称。"
-    elif code == 429:
-        hint = "请求太频繁或额度用完（429），稍后再试，或减少每次发送张数。"
-    else:
-        hint = "接口返回错误。"
-    return f"{hint}（HTTP {code}）服务端返回：{body}"
-
-
-def call_vision_model(settings, images_b64):
-    base, api_key = endpoint(settings)
-    url = base.rstrip("/") + "/chat/completions"
-    content = [{"type": "text", "text": build_prompt(parse_columns(settings["columns"]),
-                                                    settings["extra_prompt"], len(images_b64))}]
-    for b in images_b64:
-        content.append({"type": "image_url", "image_url": {"url": "data:image/webp;base64," + b}})
-    body = {"model": settings["model"].strip(), "temperature": 0,
-            "messages": [{"role": "user", "content": content}]}
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + api_key,
-                 "User-Agent": BROWSER_UA})
-    try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(http_error_hint(e.code, e.read().decode("utf-8", "replace")))
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"网络请求失败：{e.reason}")
-    except TimeoutError:
-        raise RuntimeError(f"请求超过 {REQUEST_TIMEOUT} 秒没有响应")
-    try:
-        return data["choices"][0]["message"]["content"] or ""
-    except (KeyError, IndexError, TypeError):
-        raise RuntimeError("接口返回格式不认识：" + str(data)[:300])
-
-
-def parse_table(text, columns):
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        raise RuntimeError("模型返回的内容不是 JSON：" + text[:200])
-    try:
-        rows_raw = json.loads(m.group(0)).get("rows", [])
-    except ValueError:
-        raise RuntimeError("模型返回的 JSON 无法解析：" + text[:200])
-    cols = list(columns)
-    if not cols:
-        for r in rows_raw:
-            for k in r:
-                if k != "_img" and k not in cols:
-                    cols.append(k)
-    rows = []
-    for r in rows_raw:
-        if not isinstance(r, dict):
-            continue
-        try:
-            img = int(r.get("_img", 1))
-        except (TypeError, ValueError):
-            img = 0                       # 没标注来源，稍后归到第一张图
-        data = {c: "" if r.get(c) is None else str(r.get(c)) for c in cols}
-        rows.append((img, data))
-    return cols, rows
-
-
-def chunk(items, n):
-    return [items[i:i + n] for i in range(0, len(items), n)]
-
-
-class BatchWorker(threading.Thread):
-    """依次处理若干批。每批是若干张截图，一次请求。结果通过队列交回主线程。"""
-
-    def __init__(self, settings, batches, events, cancel):
-        super().__init__(daemon=True)
-        self.settings = settings
-        self.batches = batches        # [[shot_record, ...], ...]
-        self.events = events
-        self.cancel = cancel
-
-    def run(self):
-        try:
-            for shots in self.batches:
-                if self.cancel.is_set():
-                    break
-                ids = [s["id"] for s in shots]
-                self.events.put(("start", ids))
-                t0 = time.time()
-                try:
-                    imgs = [image_to_webp_b64(s["path"], self.settings["webp_quality"]) for s in shots]
-                    text = call_vision_model(self.settings, imgs)
-                    cols, rows = parse_table(text, parse_columns(self.settings["columns"]))
-                    if not rows:
-                        raise RuntimeError("模型没有返回数据行。返回内容：" + text[:200])
-                    self.events.put(("ok", ids, cols, rows, time.time() - t0))
-                except Exception as e:
-                    log("batch failed:\n" + traceback.format_exc())
-                    self.events.put(("err", ids, str(e), time.time() - t0))
-        finally:
-            self.events.put(("finished",))
-
-
-# ---------------------------------------------------------------- 授权登录（cgwimg）
-
-class AuthThread(threading.Thread):
-    """按 app-auth-integration 流程：创建授权请求 → 交给主线程打开浏览器 → 轮询直到拿到 Key。"""
-
-    def __init__(self, events, cancel):
-        super().__init__(daemon=True)
-        self.events = events
-        self.cancel = cancel
-
-    @staticmethod
-    def _call(method, url, body=None):
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method,
-                                     headers={"Content-Type": "application/json", "User-Agent": BROWSER_UA})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            try:
-                msg = json.loads(e.read().decode("utf-8", "replace")).get("error", {}).get("message")
-            except ValueError:
-                msg = None
-            raise RuntimeError(msg or f"HTTP {e.code}")
-        if not payload.get("ok"):
-            raise RuntimeError(payload.get("error", {}).get("message", "未知错误"))
-        return payload["data"]
-
-    def run(self):
-        try:
-            grant = self._call("POST", CGW_SITE + "/api/authorize/create", {"appId": CGW_APP_ID})
-            self.events.put(("auth_url", grant["authUrl"]))
-            deadline = time.time() + int(grant.get("expiresInSec", 600))
-            query = (f"{CGW_SITE}/api/authorize/query?id={urllib.parse.quote(grant['authId'])}"
-                     f"&token={urllib.parse.quote(grant['pollToken'])}")
-            while time.time() < deadline:
-                if self.cancel.is_set():
-                    self.events.put(("auth_fail", "已取消授权"))
-                    return
-                time.sleep(2.5)
-                try:
-                    d = self._call("GET", query)
-                except (RuntimeError, OSError) as e:      # 网络抖动时继续轮询，直到超时
-                    log("auth poll error: " + str(e))
-                    continue
-                if d.get("status") == "approved" and d.get("key"):
-                    self.events.put(("auth_ok", d["key"]))
-                    return
-                if d.get("status") == "denied":
-                    self.events.put(("auth_fail", "你拒绝了授权"))
-                    return
-                if d.get("status") == "expired":
-                    break
-            self.events.put(("auth_fail", "授权已超时，请重新授权"))
-        except Exception as e:
-            log("auth failed:\n" + traceback.format_exc())
-            self.events.put(("auth_fail", str(e)))
-
-
-# ---------------------------------------------------------------- 设置
-
-def load_settings():
-    s = dict(DEFAULT_SETTINGS)
-    try:
-        with open(SETTINGS_PATH, encoding="utf-8") as f:
-            s.update(json.load(f))
-    except (OSError, ValueError):
-        pass
-    s["batch_size"] = clamp_int(s.get("batch_size"), 1, 20, 3)
-    s["webp_quality"] = clamp_int(s.get("webp_quality"), 1, 100, 85)
-    return s
-
-
-def save_settings(s):
-    os.makedirs(APP_DIR, exist_ok=True)
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False, indent=2)
-
-
-def endpoint(s):
-    """实际使用的 (base_url, api_key)：cgwimg 方式用固定地址和授权得到的 Key。"""
-    if s.get("provider") == PROVIDER_CGW:
-        return CGW_BASE_URL, str(s.get("cgw_key", "")).strip()
-    return str(s.get("base_url", "")).strip(), str(s.get("api_key", "")).strip()
-
-
-def is_configured(s):
-    base, key = endpoint(s)
-    return bool(base and key and str(s.get("model", "")).strip())
 
 
 # ---------------------------------------------------------------- 界面
@@ -551,8 +62,9 @@ class App:
         self._next_id = 1
         self.worker = None
         self.cancel = threading.Event()
-        self.copy_on = False
-        self.done = set()           # {(截图id, 行号, 列名)} 已粘贴或已跳过
+        self.paste_on = False
+        self.paste_start = None     # 右键设置的粘贴起点，存 (截图id, 行号, 列名)，None 表示从头开始
+        self.done = set()           # {(截图id, 行号, 列名)} 已粘贴的单元格
         self.col_enabled = {}       # {列名: bool} 列开关，默认开启；关闭的列粘贴时整列跳过
         self.copy_menu = None
         self.columns = []
@@ -568,7 +80,7 @@ class App:
         self.settings_win = None    # 设置窗口打开期间为 True，全局热键暂停，避免录制时误触发截图/粘贴
 
         root.title(APP_NAME)
-        root.geometry("1120x700")
+        root.geometry("1240x740")
         root.minsize(900, 560)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -578,12 +90,12 @@ class App:
         self.lbl_hotkeys = ttk.Label(top, foreground="#666")
         self.lbl_hotkeys.pack(side="left")
 
-        self.nb = ttk.Notebook(root)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=(0, 4))
-        self.tab_shots = ttk.Frame(self.nb, padding=8)
-        self.tab_run = ttk.Frame(self.nb, padding=8)
-        self.nb.add(self.tab_shots, text="  1. 截图  ")
-        self.nb.add(self.tab_run, text="  2. 识别结果  ")
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=4)
+        self.tab_shots = ttk.Frame(self.notebook, padding=(8, 6, 8, 6))
+        self.tab_run = ttk.Frame(self.notebook, padding=(8, 6, 8, 6))
+        self.notebook.add(self.tab_shots, text="截图")
+        self.notebook.add(self.tab_run, text="识别结果")
         self.build_shots_tab()
         self.build_run_tab()
 
@@ -599,10 +111,13 @@ class App:
         if not is_configured(self.settings):
             self.root.after(300, self.open_settings)
 
-    # ---------- 布局：截图页
+    # ---------- 布局：两个标签页
+    #   「截图」：顶部工具栏（选择窗口 / 截图 / 导入 / 清空截图），左侧截图列表，右侧原图
+    #   「识别结果」：识别操作和粘贴模式，左侧结果表，右侧详细
     def build_shots_tab(self):
-        bar = ttk.Frame(self.tab_shots)
-        bar.pack(fill="x", pady=(0, 8))
+        page = self.tab_shots
+        bar = ttk.Frame(page)
+        bar.pack(fill="x", pady=(0, 6))
         ttk.Button(bar, text="选择窗口…", command=self.pick_window).pack(side="left")
         # 截图范围：默认全屏；选了窗口后显示窗口名，右侧 ✕ 点击即恢复全屏
         scope = ttk.Frame(bar)
@@ -614,41 +129,70 @@ class App:
         self.btn_clear_target.pack(side="left", padx=(4, 0))
         ttk.Button(bar, text="截图", command=self.capture).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="导入图片…", command=self.import_files).pack(side="left", padx=6)
-        ttk.Button(bar, text="粘贴图片", command=self.paste_images).pack(side="left")
-        ttk.Button(bar, text="删除选中", command=self.delete_selected).pack(side="left", padx=6)
-        ttk.Button(bar, text="清空", command=self.clear_shots).pack(side="left")
-
-        body = ttk.Frame(self.tab_shots)
-        body.pack(fill="both", expand=True)
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="y")
-        self.shot_tree = ttk.Treeview(left, columns=("no", "time", "size", "state"), show="headings",
-                                      selectmode="extended", height=20)
-        for cid, text, w in (("no", "序号", 50), ("time", "时间", 80), ("size", "尺寸", 110),
-                             ("state", "状态", 80)):
-            self.shot_tree.heading(cid, text=text)
-            self.shot_tree.column(cid, width=w, stretch=False)
-        self.shot_tree.pack(fill="y")
-        self.shot_tree.bind("<<TreeviewSelect>>", self.on_shot_select)
-        self.shot_tree.bind("<Double-1>", self.on_shot_double)
-        # Ctrl+V 在截图页且剪贴板有图片时导入；没有图片就不拦截，文本粘贴照常工作
+        ttk.Button(bar, text="清空截图", command=self.clear_shots).pack(side="left", padx=6)
+        # Ctrl+V 剪贴板有图片时导入；没有图片就不拦截，文本粘贴照常工作
         self.root.bind_all("<Control-v>", self.on_ctrl_v, add="+")
 
-        self.preview = ttk.Label(body, anchor="center", text="选中截图预览；双击放大查看",
-                                 foreground="#888", cursor="hand2")
-        self.preview.pack(side="left", fill="both", expand=True, padx=(12, 0))
-        self.preview.bind("<Double-1>", self.on_shot_double)
+        pane = ttk.PanedWindow(page, orient="horizontal")
+        pane.pack(fill="both", expand=True)
 
-    # ---------- 布局：识别结果页
+        # 左：截图列表
+        lf = ttk.Frame(pane)
+        pane.add(lf, weight=1)
+        ttk.Label(lf, text="截图列表（可多选，右键删除，双击放大）").pack(anchor="w")
+        lbox = ttk.Frame(lf)
+        lbox.pack(fill="both", expand=True)
+        lbox.rowconfigure(0, weight=1)
+        lbox.columnconfigure(0, weight=1)
+        self.shot_tree = ttk.Treeview(lbox, columns=("no", "time", "size", "state"), show="headings",
+                                      selectmode="extended")
+        for cid, text, w in (("no", "序号", 46), ("time", "时间", 66), ("size", "尺寸", 96),
+                             ("state", "状态", 66)):
+            self.shot_tree.heading(cid, text=text)
+            self.shot_tree.column(cid, width=w, stretch=False)
+        shot_vsb = ttk.Scrollbar(lbox, orient="vertical", command=self.shot_tree.yview)
+        self.shot_tree.configure(yscrollcommand=shot_vsb.set)
+        self.shot_tree.grid(row=0, column=0, sticky="nsew")
+        shot_vsb.grid(row=0, column=1, sticky="ns")
+        self.shot_tree.bind("<<TreeviewSelect>>", self.on_shot_select)
+        self.shot_tree.bind("<Double-1>", self.on_shot_double)
+        self.shot_tree.bind("<Button-3>", self.on_shot_right_click)
+
+        # 右：原图
+        imgf = ttk.Frame(pane, padding=(8, 0, 0, 0))
+        pane.add(imgf, weight=2)
+        ttk.Label(imgf, text="原图（双击放大）").pack(anchor="w")
+        self.src_label = ttk.Label(imgf, anchor="center", text="选中截图或结果行查看原图",
+                                   foreground="#888", cursor="hand2")
+        self.src_label.pack(fill="both", expand=True)
+        self.src_label.bind("<Double-1>", self.on_source_double)
+
+        self.src_shot_id = None
+
     def build_run_tab(self):
-        bar = ttk.Frame(self.tab_run)
+        page = self.tab_run
+
+        # 提取设置（原在「设置」窗口）：放在操作栏上方，修改后失焦或回车即保存
+        fmt = ttk.Frame(page)
+        fmt.pack(fill="x", pady=(0, 4))
+        ttk.Label(fmt, text="提取格式（列名，逗号分隔，留空按截图表头）").pack(side="left")
+        self.var_columns = tk.StringVar(value=self.settings["columns"])
+        ent_cols = ttk.Entry(fmt, textvariable=self.var_columns, width=28)
+        ent_cols.pack(side="left", padx=(4, 16))
+        ttk.Label(fmt, text="额外提取要求").pack(side="left")
+        self.var_extra = tk.StringVar(value=self.settings["extra_prompt"])
+        ent_extra = ttk.Entry(fmt, textvariable=self.var_extra)
+        ent_extra.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        for ent in (ent_cols, ent_extra):
+            ent.bind("<FocusOut>", self.on_extract_changed)
+            ent.bind("<Return>", self.on_extract_changed)
+
+        bar = ttk.Frame(page)
         bar.pack(fill="x", pady=(0, 6))
-        self.btn_run_pending = ttk.Button(bar, text="识别待处理", command=self.run_pending)
+        self.btn_run_pending = ttk.Button(bar, text="识别", command=self.run_pending)
         self.btn_run_pending.pack(side="left")
         self.btn_rerun = ttk.Button(bar, text="重新识别全部", command=self.rerun_all)
         self.btn_rerun.pack(side="left", padx=6)
-        self.btn_cancel = ttk.Button(bar, text="取消", command=self.cancel_run, state="disabled")
-        self.btn_cancel.pack(side="left")
         ttk.Label(bar, text="每次请求张数").pack(side="left", padx=(16, 4))
         self.var_batch = tk.StringVar(value=str(self.settings["batch_size"]))
         ttk.Spinbox(bar, from_=1, to=20, width=4, textvariable=self.var_batch).pack(side="left")
@@ -658,45 +202,55 @@ class App:
         self.lbl_progress = ttk.Label(bar, text="")
         self.lbl_progress.pack(side="right")
 
-        ops = ttk.Frame(self.tab_run)
+        ops = ttk.Frame(page)
         ops.pack(fill="x", pady=(0, 6))
-        self.btn_copy = ttk.Button(ops, text="复制模式：关", command=self.toggle_copy)
-        self.btn_copy.pack(side="left")
-        ttk.Button(ops, text="跳过下一个", command=self.skip_next).pack(side="left", padx=6)
-        ttk.Button(ops, text="重置进度", command=self.reset_progress).pack(side="left")
-        ttk.Button(ops, text="清空结果", command=self.clear_results).pack(side="left", padx=6)
-        ttk.Label(ops, text="点击行查看来源截图；双击单元格可修改", foreground="#888").pack(side="right")
+        self.btn_paste = ttk.Button(ops, text="粘贴模式：关", command=self.toggle_paste)
+        self.btn_paste.pack(side="left")
+        ttk.Button(ops, text="清空识别结果", command=self.clear_results).pack(side="left", padx=6)
+        ttk.Label(ops, text="点击行查看来源截图、原图和详细", foreground="#888").pack(side="right")
 
-        pane = ttk.PanedWindow(self.tab_run, orient="horizontal")
+        self.lbl_paste_hint = ttk.Label(page, foreground="#555", justify="left")
+        self.lbl_paste_hint.pack(fill="x", pady=(0, 6))
+
+        pane = ttk.PanedWindow(page, orient="horizontal")
         pane.pack(fill="both", expand=True)
+
+        # 左：结果表
         rf = ttk.Frame(pane)
         pane.add(rf, weight=3)
-        self.res_tree = ttk.Treeview(rf, show="headings", selectmode="browse")
-        vsb = ttk.Scrollbar(rf, orient="vertical", command=self.res_tree.yview)
-        hsb = ttk.Scrollbar(rf, orient="horizontal", command=self.res_tree.xview)
+        rbox = ttk.Frame(rf)
+        rbox.pack(fill="both", expand=True)
+        rbox.rowconfigure(0, weight=1)
+        rbox.columnconfigure(0, weight=1)
+        self.res_tree = ttk.Treeview(rbox, show="headings", selectmode="browse")
+        vsb = ttk.Scrollbar(rbox, orient="vertical", command=self.res_tree.yview)
+        hsb = ttk.Scrollbar(rbox, orient="horizontal", command=self.res_tree.xview)
         self.res_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.res_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        rf.rowconfigure(0, weight=1)
-        rf.columnconfigure(0, weight=1)
         self.res_tree.bind("<<TreeviewSelect>>", self.on_result_select)
         self.res_tree.bind("<Double-1>", self.on_double_click)
         self.res_tree.bind("<Button-1>", self.on_result_click)
         self.res_tree.bind("<Button-3>", self.on_result_right_click)
 
-        sf = ttk.Frame(pane, padding=(8, 0, 0, 0))
-        pane.add(sf, weight=2)
-        ttk.Label(sf, text="来源截图").pack(anchor="w")
-        self.src_label = ttk.Label(sf, anchor="center", text="点击左侧结果行查看来源截图",
-                                   foreground="#888", cursor="hand2")
-        self.src_label.pack(fill="both", expand=True)
-        self.src_label.bind("<Double-1>", self.on_source_double)
+        # 右：原图（上）+ 详细（下）
+        rt = ttk.PanedWindow(pane, orient="vertical")
+        pane.add(rt, weight=2)
+        imgf = ttk.Frame(rt, padding=(8, 0, 0, 4))
+        ttk.Label(imgf, text="原图（双击放大）").pack(anchor="w")
+        self.src_label2 = ttk.Label(imgf, anchor="center", text="选中结果行查看原图",
+                                    foreground="#888", cursor="hand2")
+        self.src_label2.pack(fill="both", expand=True)
+        self.src_label2.bind("<Double-1>", self.on_source_double)
+        rt.add(imgf, weight=3)
 
-        ttk.Label(sf, text="详细").pack(anchor="w", pady=(8, 2))
-        df = ttk.Frame(sf)
+        detf = ttk.Frame(rt, padding=(8, 0, 0, 0))
+        rt.add(detf, weight=2)
+        ttk.Label(detf, text="详细").pack(anchor="w")
+        df = ttk.Frame(detf)
         df.pack(fill="both", expand=True)
-        self.detail = tk.Text(df, height=10, wrap="word", state="disabled",
+        self.detail = tk.Text(df, height=8, wrap="word", state="disabled",
                               background="#fafafa", relief="solid", borderwidth=1, padx=6, pady=4)
         dsb = ttk.Scrollbar(df, orient="vertical", command=self.detail.yview)
         self.detail.configure(yscrollcommand=dsb.set)
@@ -705,8 +259,6 @@ class App:
         self.detail.tag_configure("key", foreground="#555", font=("Microsoft YaHei UI", 9, "bold"))
         self.detail.tag_configure("val", font=("Microsoft YaHei UI", 10))
         self.detail.tag_configure("meta", foreground="#888")
-
-        self.src_shot_id = None
         self.show_detail(None)
 
     # ---------- 状态与热键
@@ -724,6 +276,10 @@ class App:
     def update_hotkey_label(self):
         self.lbl_hotkeys.config(text=f"截图：{self.settings['recognize_hotkey']}    "
                                      f"粘贴：{self.settings['paste_hotkey']}")
+        self.lbl_paste_hint.config(text=(
+            f"粘贴模式开启后，按粘贴快捷键（{self.settings['paste_hotkey'].upper()}）即可把下一格内容粘贴到当前窗口，"
+            "粘贴完自动跳到下一格。\n"
+            "右键单元格可设为粘贴起点（标 ▶）；双击单元格可手动修改识别结果。"))
 
     def start_hotkeys(self):
         self.stop_hotkeys()
@@ -741,9 +297,7 @@ class App:
 
     def stop_hotkeys(self):
         if self.hk is not None:
-            if self.hk.thread_id:
-                user32.PostThreadMessageW(self.hk.thread_id, WM_QUIT, 0, 0)
-            self.hk.join(2)
+            self.hk.stop()
             self.hk = None
 
     # ---------- 事件循环（主线程）
@@ -779,6 +333,7 @@ class App:
         elif kind == "err":
             for s in self.find_shots(ev[1]):
                 s["state"], s["msg"] = "失败", ev[2]
+                s["failed_at"] = time.time()
             self.refresh_shots()
             self.say("识别失败：" + ev[2][:200])
         elif kind == "auth_url":
@@ -794,11 +349,10 @@ class App:
             self._auth_msg("授权未完成：" + ev[1])
         elif kind == "finished":
             self.worker = None
-            self.btn_cancel.state(["disabled"])
             self.refresh_shots()
             self.refresh_results()
             failed = sum(1 for s in self.shots if s["state"] == "失败")
-            self.say(f"识别结束。" + (f"有 {failed} 张失败，可点「识别待处理」重试。" if failed else ""))
+            self.say("识别结束。" + (f"有 {failed} 张失败，可点「识别」重试。" if failed else ""))
 
     def find_shots(self, ids):
         return [s for s in self.shots if s["id"] in ids]
@@ -820,7 +374,7 @@ class App:
         try:
             if target is None:
                 path = capture_screen()
-            elif not user32.IsWindow(target.hwnd):
+            elif not window_alive(target):
                 self.clear_target()
                 return self.say("指定的窗口已关闭，已恢复为全屏。请重新截图。")
             else:
@@ -829,14 +383,11 @@ class App:
             log("capture failed:\n" + traceback.format_exc())
             return self.say("截图失败：" + str(e))
         self.add_shot(path)
-        self.nb.select(self.tab_shots)
         what = f"窗口「{target.title[:30]}」" if target else "全屏"
         self.say(f"已截取{what}，共 {len(self.shots)} 张。")
 
     def on_ctrl_v(self, event):
-        """只在「截图」页、焦点不在文本输入控件时，且剪贴板确实有图片时才接管 Ctrl+V。"""
-        if self.nb.select() != str(self.tab_shots):
-            return None
+        """焦点不在文本输入控件时，且剪贴板确实有图片时才接管 Ctrl+V。"""
         if event.widget.winfo_class() in ("Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"):
             return None
         try:
@@ -894,7 +445,6 @@ class App:
         if self.shots:
             self.shot_tree.selection_set(str(self.shots[-1]["id"]))
             self.shot_tree.see(str(self.shots[-1]["id"]))
-        self.nb.select(self.tab_shots)
         msg = f"已导入 {added} 张，共 {len(self.shots)} 张。" if added else "没有导入任何图片。"
         if failed:
             msg += " 失败 " + str(len(failed)) + " 个：" + "；".join(failed[:3])
@@ -912,16 +462,33 @@ class App:
         self.shot_tree.selection_set(str(self.shots[-1]["id"]))
         self.shot_tree.see(str(self.shots[-1]["id"]))
 
+    def shot_color(self, sid):
+        """截图的底色：按截图在列表中的位置取色。截图列表和结果行用同一个函数，颜色始终一致。"""
+        idx = next((i for i, s in enumerate(self.shots) if s["id"] == sid), 0)
+        return GROUP_COLORS[idx % len(GROUP_COLORS)]
+
+    def apply_shot_colors(self):
+        for s in self.shots:
+            tag = f"shot{s['id']}"
+            self.shot_tree.tag_configure(tag, background=self.shot_color(s["id"]))
+            self.res_tree.tag_configure(tag, background=self.shot_color(s["id"]))
+
     def refresh_shots(self):
         sel = set(self.shot_tree.selection())
         self.shot_tree.delete(*self.shot_tree.get_children())
         for i, s in enumerate(self.shots, start=1):
-            self.shot_tree.insert("", "end", iid=str(s["id"]),
+            self.shot_tree.insert("", "end", iid=str(s["id"]), tags=(f"shot{s['id']}",),
                                   values=(i, s["time"], s["size"], s["state"]))
         for iid in sel:
             if self.shot_tree.exists(iid):
                 self.shot_tree.selection_add(iid)
+        self.apply_shot_colors()
         self.update_mode()
+
+    def on_shot_select(self, _=None):
+        sel = self.selected_shot_ids()
+        if sel and sel[-1] != self.src_shot_id and self.shot_by_id(sel[-1]):
+            self.show_source(sel[-1])
 
     def pick_window(self):
         wins = list_windows(own_hwnd=self.root.winfo_id())
@@ -987,6 +554,19 @@ class App:
     def selected_shot_ids(self):
         return [int(i) for i in self.shot_tree.selection()]
 
+    def on_shot_right_click(self, event):
+        iid = self.shot_tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self.shot_tree.selection():
+            self.shot_tree.selection_set(iid)
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="删除选中截图", command=self.delete_selected)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def delete_selected(self):
         ids = set(self.selected_shot_ids())
         if not ids:
@@ -1002,14 +582,14 @@ class App:
         self.shots = keep
         self.refresh_shots()
         self.refresh_results()
-        self.show_preview(None)
+        self.show_source(None)
         self.say(f"已删除 {len(ids)} 张，剩余 {len(self.shots)} 张")
 
     def clear_shots(self):
         if not self.shots:
             return self.say("截图列表已经是空的")
         if self.worker is not None:
-            return self.say("正在识别中，请先取消或等待结束")
+            return self.say("正在识别中，请等待识别结束")
         if not messagebox.askyesno("确认", f"清空全部 {len(self.shots)} 张截图（同时清空识别结果）？",
                                    parent=self.root):
             return
@@ -1017,18 +597,20 @@ class App:
             self.remove_file(s["path"])
         self.shots = []
         self.done.clear()
+        self.paste_start = None
         self.refresh_shots()
         self.refresh_results()
-        self.show_preview(None)
+        self.show_source(None)
         self.say("截图和识别结果已清空")
 
     def clear_results(self):
         """只清空识别结果，保留截图；截图状态回到「待识别」。"""
         if self.worker is not None:
-            return self.say("正在识别中，请先取消或等待结束")
+            return self.say("正在识别中，请等待识别结束")
         for s in self.shots:
             s.update(state="待识别", rows=[], cols=[], msg="")
         self.done.clear()
+        self.paste_start = None
         self.refresh_shots()
         self.refresh_results()
         self.say("识别结果已清空，截图已保留")
@@ -1043,25 +625,16 @@ class App:
     def shot_by_id(self, sid):
         return next((s for s in self.shots if s["id"] == sid), None)
 
-    def on_shot_select(self, _=None):
-        sel = self.selected_shot_ids()
-        if sel:
-            s = self.shot_by_id(sel[-1])
-            if s:
-                self.show_preview(s)
-
-    def show_preview(self, s):
-        if not s:
-            self.preview.config(image="", text="选中截图预览；双击放大查看")
-            self._photo = None
+    def on_extract_changed(self, _=None):
+        cols = self.var_columns.get().strip()
+        extra = self.var_extra.get().strip()
+        if cols == self.settings["columns"] and extra == self.settings["extra_prompt"]:
             return
-        try:
-            im = Image.open(s["path"])
-            im.thumbnail((620, 460))
-            self._photo = ImageTk.PhotoImage(im.convert("RGB"))
-            self.preview.config(image=self._photo, text="")
-        except OSError as e:
-            self.preview.config(image="", text=f"无法预览：{e}")
+        self.settings["columns"] = cols
+        self.settings["extra_prompt"] = extra
+        save_settings(self.settings)
+        self.refresh_results()
+        self.say("提取格式已保存，下次识别生效。" if cols or extra else "提取设置已清空。")
 
     def on_shot_double(self, _=None):
         sel = self.selected_shot_ids()
@@ -1137,7 +710,7 @@ class App:
     def _start_batches(self, shots, label):
         """shots: 要识别的截图记录列表。按「每次请求张数」切分后启动后台线程。"""
         if self.worker is not None:
-            return self.say("正在识别中，请等待或先取消")
+            return self.say("正在识别中，请等待识别结束")
         if not is_configured(self.settings):
             return self.open_settings()
         if not shots:
@@ -1152,7 +725,6 @@ class App:
         self.cancel.clear()
         self.worker = BatchWorker(dict(self.settings), batches, self.q, self.cancel)
         self.worker.start()
-        self.btn_cancel.state(["!disabled"])
         self.auto_last_check = time.time()
         self.refresh_shots()
         self.say(f"{label}：{len(shots)} 张，分 {len(batches)} 次请求，每次最多 {n} 张")
@@ -1162,14 +734,14 @@ class App:
         shots = [s for s in self.shots if s["state"] in ("待识别", "失败")]
         if not shots:
             return self.say("没有待处理的截图")
-        self._start_batches(shots, "识别待处理")
+        self._start_batches(shots, "识别")
 
     def rerun_all(self):
         """重新识别全部截图（覆盖已有结果）。"""
         if not self.shots:
             return self.say("还没有截图")
         if self.worker is not None:
-            return self.say("正在识别中，请等待或先取消")
+            return self.say("正在识别中，请等待识别结束")
         if any(s["state"] == "已识别" for s in self.shots) and not messagebox.askyesno(
                 "确认", "重新识别会覆盖已有结果，继续吗？", parent=self.root):
             return
@@ -1177,11 +749,6 @@ class App:
         for s in self.shots:
             s.update(rows=[], cols=[], msg="")
         self._start_batches(list(self.shots), "重新识别全部")
-
-    def cancel_run(self):
-        if self.worker is not None:
-            self.cancel.set()
-            self.say("已请求取消：当前请求返回后停止，之后的不再发送")
 
     # ---------- 自动识别
     def toggle_auto(self):
@@ -1201,17 +768,20 @@ class App:
             self.auto_on = False
             self.var_auto.set(False)
             return self.say("自动识别已关闭：请先在「设置」里填写 Base URL、API Key 和模型名称。")
-        # 只自动处理「待识别」的截图。失败的不自动重试，避免每分钟反复消耗额度，由用户手动重试。
-        pending = [s for s in self.shots if s["state"] == "待识别"]
+        # 待识别的截图，以及失败超过 AUTO_INTERVAL_SEC 秒的截图，都会被自动识别。
+        # 失败的截图要冷却一段时间再重试：接口持续出错时不会每次检查都立刻重发。
+        now = time.time()
+        pending = [s for s in self.shots if s["state"] == "待识别"
+                   or (s["state"] == "失败" and now - s.get("failed_at", 0) >= AUTO_INTERVAL_SEC)]
         if not pending:
-            self.auto_last_check = time.time()
+            self.auto_last_check = now
             return
-        # 触发条件：待识别截图攒够「每次请求张数」就识别一次（只取最早的 n 张）；
+        # 触发条件：待处理截图攒够「每次请求张数」就识别一次（只取最早的 n 张）；
         # 不足 n 张时，每 AUTO_INTERVAL_SEC 秒把剩下的全部识别一次。
         n = clamp_int(self.var_batch.get(), 1, 20, 3)
         if len(pending) >= n:
             self._start_batches(pending[:n], f"自动识别（已攒够 {n} 张）")
-        elif time.time() - self.auto_last_check >= AUTO_INTERVAL_SEC:
+        elif now - self.auto_last_check >= AUTO_INTERVAL_SEC:
             self._start_batches(pending, f"自动识别（每 {AUTO_INTERVAL_SEC} 秒检查）")
 
     # ---------- 结果表
@@ -1244,22 +814,17 @@ class App:
 
         seen = {}
         for n, r in enumerate(self.result_rows):
-            key = self.row_key(r["data"], cols)
+            key = row_key(r["data"], cols)
             seen[key] = seen.get(key, 0) + 1
         for n, r in enumerate(self.result_rows):
-            key = self.row_key(r["data"], cols)
+            key = row_key(r["data"], cols)
             dup = seen[key] > 1
             tag = f"shot{r['shot_id']}"
             vals = [f"{n + 1}{' ⚠重复' if dup else ''}"] + [
                 self.disp(n, c, r["data"].get(c, "")) for c in cols]
             self.res_tree.insert("", "end", iid=str(n), values=vals, tags=(tag,))
-        for i, sid in enumerate(sorted({r["shot_id"] for r in self.result_rows})):
-            self.res_tree.tag_configure(f"shot{sid}", background=GROUP_COLORS[i % len(GROUP_COLORS)])
+        self.apply_shot_colors()
         self.update_progress()
-
-    @staticmethod
-    def row_key(data, cols):
-        return tuple(one_line(data.get(c, "")).strip() for c in cols)
 
     def dkey(self, n, col):
         """已处理标记的稳定键：用截图 id + 行在该截图内的序号 + 列名，不随行号变化。"""
@@ -1268,7 +833,12 @@ class App:
 
     def disp(self, n, col, value):
         shown = one_line(value)
-        return ("✓ " + shown) if value and self.dkey(n, col) in self.done else shown
+        key = self.dkey(n, col)
+        if value and key in self.done:
+            shown = "✓ " + shown
+        if key == self.paste_start:
+            shown = "▶ " + shown
+        return shown
 
     def update_progress(self):
         total = done = 0
@@ -1281,13 +851,17 @@ class App:
         self.lbl_progress.config(text=f"进度 {done}/{total}" if total else "")
 
     def next_pos(self):
-        """下一个可粘贴的单元格：所在列开关必须开启，且有内容、未处理。"""
-        for n, r in enumerate(self.result_rows):
-            for c in self.columns:
-                if not self.col_enabled.get(c, True):
-                    continue
-                if r["data"].get(c, "") and self.dkey(n, c) not in self.done:
-                    return n, c
+        """下一个可粘贴的单元格：从粘贴起点开始向后找，到末尾后回到开头。
+        所在列开关必须开启，且有内容、未粘贴。"""
+        cells = [(n, c) for n in range(len(self.result_rows)) for c in self.columns]
+        start = 0
+        if self.paste_start is not None:
+            start = next((i for i, (n, c) in enumerate(cells) if self.dkey(n, c) == self.paste_start), 0)
+        for n, c in cells[start:] + cells[:start]:
+            if not self.col_enabled.get(c, True):
+                continue
+            if self.result_rows[n]["data"].get(c, "") and self.dkey(n, c) not in self.done:
+                return n, c
         return None
 
     def on_result_select(self, _=None):
@@ -1297,6 +871,9 @@ class App:
         n = int(sel[0])
         sid = self.result_rows[n]["shot_id"]
         self.show_source(sid)
+        if self.shot_tree.exists(str(sid)):
+            self.shot_tree.selection_set(str(sid))
+            self.shot_tree.see(str(sid))
         self.show_detail(n)
 
     def show_detail(self, n):
@@ -1316,7 +893,7 @@ class App:
             self.detail.insert("end", f"{c}\n", "key")
             value = r["data"].get(c, "")
             self.detail.insert("end", (value if value else "（空）") + "\n\n", "val")
-        if self.row_key(r["data"], self.columns) in self.duplicate_keys():
+        if row_key(r["data"], self.columns) in self.duplicate_keys():
             self.detail.insert("end", "⚠ 该行内容与其他行重复", "meta")
         self.detail.config(state="disabled")
 
@@ -1326,23 +903,29 @@ class App:
     def duplicate_keys(self):
         counts = {}
         for r in self.result_rows:
-            k = self.row_key(r["data"], self.columns)
+            k = row_key(r["data"], self.columns)
             counts[k] = counts.get(k, 0) + 1
         return {k for k, v in counts.items() if v > 1}
 
     def show_source(self, sid):
-        s = self.shot_by_id(sid)
+        """在「截图」页和「识别结果」页同时显示来源截图的原图。"""
+        s = self.shot_by_id(sid) if sid is not None else None
         self.src_shot_id = sid
+        self._show_thumb(self.src_label, s, sid, (360, 420), "_photo_src")
+        self._show_thumb(self.src_label2, s, sid, (360, 260), "_photo_src2")
+
+    def _show_thumb(self, label, s, sid, box, attr):
         if not s:
-            self.src_label.config(image="", text="来源截图已删除")
+            label.config(image="", text="选中截图或结果行查看原图" if sid is None else "来源截图已删除")
             return
         try:
             im = Image.open(s["path"])
-            im.thumbnail((420, 520))
-            self._photo_src = ImageTk.PhotoImage(im.convert("RGB"))
-            self.src_label.config(image=self._photo_src, text="")
+            im.thumbnail(box)
+            # 必须保留 PhotoImage 的引用，否则会被垃圾回收而不显示
+            setattr(self, attr, ImageTk.PhotoImage(im.convert("RGB")))
+            label.config(image=getattr(self, attr), text="")
         except OSError as e:
-            self.src_label.config(image="", text=f"无法显示：{e}")
+            label.config(image="", text=f"无法显示：{e}")
 
     def on_result_click(self, event):
         """点击表头的列名切换该列开关（☑ 启用 / ☐ 停用）。"""
@@ -1367,6 +950,15 @@ class App:
         self.res_tree.selection_set(iid)
         n = int(iid)
         menu = tk.Menu(self.root, tearoff=0)
+        col_id = self.res_tree.identify_column(event.x)
+        if self.columns:
+            # 序号列按第一列计算；数据列从 "#2" 开始
+            idx = 0 if col_id in ("#0", "#1") else int(col_id[1:]) - 2
+            if 0 <= idx < len(self.columns):
+                cname = self.columns[idx]
+                menu.add_command(label=f"从这里开始粘贴（{cname}）",
+                                 command=lambda: self.set_paste_start(n, cname))
+                menu.add_separator()
         menu.add_command(label="删除此行", command=lambda: self.delete_rows([n]))
         sid = self.result_rows[n]["shot_id"]
         menu.add_command(label="删除此截图的全部结果行", command=lambda: self.delete_shot_rows(sid))
@@ -1406,20 +998,13 @@ class App:
             for i in removed:
                 del s["rows"][i]
             self._reindex_shot(s["id"], removed)
+        self.paste_start = None
         self.refresh_shots()
         self.refresh_results()
 
     def _reindex_shot(self, sid, removed_idx):
-        """removed_idx 为已删除的行号（删除前的原序号）。把同一截图中之后的行号前移，保持已粘贴标记对齐。"""
-        def new_index(i):
-            return i - sum(1 for d in removed_idx if d < i)
-
-        removed_set = set(removed_idx)
-        self.done = {
-            (s, new_index(i), c) if s == sid else (s, i, c)
-            for (s, i, c) in self.done
-            if not (s == sid and i in removed_set)
-        }
+        """removed_idx 为已删除的行号（删除前的原序号）。"""
+        self.done = reindex_done(self.done, sid, removed_idx)
 
     def on_double_click(self, event):
         iid = self.res_tree.identify_row(event.y)
@@ -1449,21 +1034,21 @@ class App:
         entry.bind("<FocusOut>", commit)
         entry.bind("<Escape>", lambda e: entry.destroy())
 
-    def reset_progress(self):
-        self.done.clear()
+    def set_paste_start(self, n, col):
+        self.paste_start = self.dkey(n, col)
         self.refresh_results()
-        self.say("进度已重置")
+        self.say(f"粘贴起点已设为第{n + 1}行 [{col}]（标 ▶）。按粘贴快捷键从这里开始粘贴。")
 
-    # ---------- 复制模式
-    def toggle_copy(self):
-        self.copy_on = not self.copy_on
-        self.btn_copy.config(text="复制模式：开" if self.copy_on else "复制模式：关")
-        self.say("复制模式已开启：按粘贴快捷键，把下一个未填单元格粘贴到当前窗口。" if self.copy_on
-                 else "复制模式已关闭，粘贴快捷键不再生效。")
+    # ---------- 粘贴模式
+    def toggle_paste(self):
+        self.paste_on = not self.paste_on
+        self.btn_paste.config(text="粘贴模式：开" if self.paste_on else "粘贴模式：关")
+        self.say("粘贴模式已开启：按粘贴快捷键，把下一个未填单元格粘贴到当前窗口。" if self.paste_on
+                 else "粘贴模式已关闭，粘贴快捷键不再生效。")
 
     def on_paste_hotkey(self):
-        if not self.copy_on:
-            return self.say("复制模式未开启：请在「识别结果」页点击「复制模式」后再使用粘贴快捷键")
+        if not self.paste_on:
+            return self.say("粘贴模式未开启：请在「识别结果」页点击「粘贴模式」后再使用粘贴快捷键")
         pos = self.next_pos()
         if pos is None:
             return self.say("没有可粘贴的单元格了（已全部完成或还没有结果）")
@@ -1477,15 +1062,6 @@ class App:
         wait_modifiers_released()
         send_ctrl_v()
         self.say(f"已粘贴 第{n + 1}行 [{col}]：{one_line(value)}")
-
-    def skip_next(self):
-        pos = self.next_pos()
-        if pos is None:
-            return self.say("没有剩余单元格")
-        n, col = pos
-        self.done.add(self.dkey(n, col))
-        self.refresh_results()
-        self.say(f"已跳过 第{n + 1}行 [{col}]")
 
     # ---------- 设置窗口
     def open_settings(self):
@@ -1658,15 +1234,8 @@ class App:
         combo.bind("<<ComboboxSelected>>", on_provider)
         on_provider()
 
-        field(8, "提取格式（列名）", "columns", "用逗号分隔，例如：项目,数量,单价。留空则按截图表头自动识别")
-        field(10, "图片 WebP 质量", "webp_quality", "1-100，默认 85")
-
-        ttk.Label(frm, text="额外提取要求").grid(row=12, column=0, sticky="nw", pady=(6, 0))
-        extra = tk.Text(frm, width=56, height=4, wrap="word")
-        extra.grid(row=12, column=1, sticky="ew", padx=(10, 0), pady=(6, 0))
-        extra.insert("1.0", s["extra_prompt"])
-        ttk.Label(frm, text="可选，例如：金额保留两位小数；忽略合计行", foreground="#888").grid(
-            row=13, column=1, sticky="w", padx=(10, 0))
+        # 提取格式、额外提取要求已移到「识别结果」页，识别按钮上方
+        field(8, "图片 WebP 质量", "webp_quality", "1-100，默认 85")
 
         def save():
             new = dict(s)
@@ -1676,7 +1245,6 @@ class App:
                                else PROVIDER_CUSTOM)
             if new["provider"] == PROVIDER_CGW:
                 new["model"] = CGW_MODEL          # cgwimg 固定模型，不接受界面输入
-            new["extra_prompt"] = extra.get("1.0", "end").strip()
             try:
                 rk = parse_hotkey(new["recognize_hotkey"])
                 pk = parse_hotkey(new["paste_hotkey"])
@@ -1702,7 +1270,7 @@ class App:
             win.destroy()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=14, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        btns.grid(row=10, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="取消", command=close_settings).pack(side="right")
         ttk.Button(btns, text="保存", command=save).pack(side="right", padx=6)
 
