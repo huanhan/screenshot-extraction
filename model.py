@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """结果表的纯数据逻辑：行的比对键、删除行后已粘贴标记的重新编号。不依赖界面。"""
+import csv
+
 from app_config import one_line
 
 
@@ -19,3 +21,12 @@ def reindex_done(done, sid, removed_idx):
         for (s, i, c) in done
         if not (s == sid and i in removed_set)
     }
+
+
+def export_csv(path, columns, rows):
+    """把结果表写成 CSV。rows 为每行的 dict 列表。用 UTF-8 带 BOM 编码，Excel 直接打开中文不乱码。"""
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(columns)
+        for data in rows:
+            w.writerow([data.get(c, "") for c in columns])

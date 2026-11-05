@@ -27,7 +27,7 @@ import tkinter as tk
 import webbrowser
 from tkinter import ttk, messagebox, filedialog
 
-from PIL import Image, ImageGrab, ImageTk
+from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
 from app_config import (APP_NAME, AUTO_INTERVAL_SEC, CGW_MODEL, IMAGE_EXTS, LOG_PATH, PROVIDER_CGW,
                         PROVIDER_CUSTOM, PROVIDER_LABELS, clamp_int, is_configured, load_settings, log,
@@ -36,7 +36,7 @@ from capture import capture_screen, capture_window, list_windows, save_shot, win
 from cgw_auth import AuthThread
 from hotkeys import (_MODIFIER_KEYSYMS, HotkeyThread, hotkey_from_event, parse_hotkey, send_ctrl_v,
                      wait_modifiers_released)
-from model import reindex_done, row_key
+from model import export_csv, reindex_done, row_key
 from recognize import BatchWorker, chunk
 
 # 同一张图里的行用这些颜色成组（浅色底，便于看清）
@@ -129,6 +129,7 @@ class App:
         self.btn_clear_target.pack(side="left", padx=(4, 0))
         ttk.Button(bar, text="截图", command=self.capture).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="导入图片…", command=self.import_files).pack(side="left", padx=6)
+        ttk.Button(bar, text="文本识别…", command=self.text_input).pack(side="left", padx=6)
         ttk.Button(bar, text="清空截图", command=self.clear_shots).pack(side="left", padx=6)
         # Ctrl+V 剪贴板有图片时导入；没有图片就不拦截，文本粘贴照常工作
         self.root.bind_all("<Control-v>", self.on_ctrl_v, add="+")
@@ -166,8 +167,15 @@ class App:
                                    foreground="#888", cursor="hand2")
         self.src_label.pack(fill="both", expand=True)
         self.src_label.bind("<Double-1>", self.on_source_double)
+        self.src_text = self._make_src_text(imgf)     # 文本记录：显示聊天原文，与图片互换
 
         self.src_shot_id = None
+
+    @staticmethod
+    def _make_src_text(parent):
+        """右侧预览的文本版本（只读）：文本记录选中时显示原文，平时不显示。"""
+        return tk.Text(parent, wrap="word", state="disabled", background="#fafafa",
+                       relief="solid", borderwidth=1, padx=6, pady=4)
 
     def build_run_tab(self):
         page = self.tab_run
@@ -207,6 +215,7 @@ class App:
         self.btn_paste = ttk.Button(ops, text="粘贴模式：关", command=self.toggle_paste)
         self.btn_paste.pack(side="left")
         ttk.Button(ops, text="清空识别结果", command=self.clear_results).pack(side="left", padx=6)
+        ttk.Button(ops, text="导出表格…", command=self.export_table).pack(side="left", padx=6)
         ttk.Label(ops, text="点击行查看来源截图、原图和详细", foreground="#888").pack(side="right")
 
         self.lbl_paste_hint = ttk.Label(page, foreground="#555", justify="left")
@@ -243,6 +252,7 @@ class App:
                                     foreground="#888", cursor="hand2")
         self.src_label2.pack(fill="both", expand=True)
         self.src_label2.bind("<Double-1>", self.on_source_double)
+        self.src_text2 = self._make_src_text(imgf)
         rt.add(imgf, weight=3)
 
         detf = ttk.Frame(rt, padding=(8, 0, 0, 0))
@@ -462,6 +472,47 @@ class App:
         self.shot_tree.selection_set(str(self.shots[-1]["id"]))
         self.shot_tree.see(str(self.shots[-1]["id"]))
 
+    # ---------- 文本识别
+    def text_input(self):
+        """弹出输入框，粘贴微信聊天记录；点「提取」后加入截图列表并立即识别。"""
+        win = tk.Toplevel(self.root)
+        win.title("文本识别")
+        win.geometry("560x420")
+        win.transient(self.root)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="可以复制微信聊天记录，粘贴到下面的输入框，点「提取」自动识别。",
+                  foreground="#555").pack(anchor="w")
+        box = tk.Text(frm, wrap="word", relief="solid", borderwidth=1, padx=6, pady=4)
+        box.pack(fill="both", expand=True, pady=(8, 8))
+        box.focus_set()
+
+        def submit():
+            text = box.get("1.0", "end").strip()
+            if not text:
+                return messagebox.showwarning("提示", "请先粘贴聊天记录", parent=win)
+            win.destroy()
+            self.add_text_shot(text)
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="提取", command=submit).pack(side="right", padx=6)
+
+    def add_text_shot(self, text):
+        """文本记录与截图同列表：没有图片文件，path 为 None，text 为聊天原文。"""
+        self.shots.append({"id": self._next_id, "path": None, "text": text,
+                           "time": time.strftime("%H:%M:%S"), "size": f"文本 {len(text)} 字",
+                           "state": "待识别", "rows": [], "cols": [], "msg": ""})
+        self._next_id += 1
+        self.refresh_shots()
+        self.shot_tree.selection_set(str(self.shots[-1]["id"]))
+        self.shot_tree.see(str(self.shots[-1]["id"]))
+        if self.worker is None:
+            self._start_batches([self.shots[-1]], "文本识别")
+        else:
+            self.say("已加入文本记录，等当前识别结束后处理。")
+
     def shot_color(self, sid):
         """截图的底色：按截图在列表中的位置取色。截图列表和结果行用同一个函数，颜色始终一致。"""
         idx = next((i for i, s in enumerate(self.shots) if s["id"] == sid), 0)
@@ -615,8 +666,27 @@ class App:
         self.refresh_results()
         self.say("识别结果已清空，截图已保留")
 
+    def export_table(self):
+        """把当前结果表（所有列、所有行，按界面顺序）导出为 CSV。"""
+        if not self.result_rows:
+            return self.say("没有可导出的结果")
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="导出表格", defaultextension=".csv",
+            filetypes=[("CSV 表格（可用 Excel 打开）", "*.csv")],
+            initialfile=f"识别结果_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        if not path:
+            return
+        try:
+            export_csv(path, self.columns, [r["data"] for r in self.result_rows])
+        except OSError as e:
+            log("export failed:\n" + traceback.format_exc())
+            return self.say("导出失败：" + str(e))
+        self.say(f"已导出 {len(self.result_rows)} 行到 {path}")
+
     @staticmethod
     def remove_file(path):
+        if not path:                    # 文本记录没有文件
+            return
         try:
             os.remove(path)
         except OSError:
@@ -650,7 +720,9 @@ class App:
                 self.open_zoom(s["path"], s["time"])
 
     def open_zoom(self, path, title):
-        """放大查看：全尺寸，超出窗口时可滚动拖动；Ctrl+滚轮缩放。"""
+        """放大查看：全尺寸，超出窗口时可滚动拖动；Ctrl+滚轮缩放。文本记录没有图片，不放大。"""
+        if not path:
+            return
         win = tk.Toplevel(self.root)
         win.title(f"查看截图 - {title}")
         win.geometry("1000x700")
@@ -719,7 +791,11 @@ class App:
         if n != self.settings["batch_size"]:
             self.settings["batch_size"] = n
             save_settings(self.settings)
-        batches = chunk([{"id": s["id"], "path": s["path"]} for s in shots], n)
+        # 图片按「每次请求张数」合并；文本记录各自一次请求，不和图片混在一起
+        imgs = [s for s in shots if s.get("text") is None]
+        texts = [s for s in shots if s.get("text") is not None]
+        batches = chunk([{"id": s["id"], "path": s["path"], "text": None} for s in imgs], n)
+        batches += [[{"id": s["id"], "path": None, "text": s["text"]}] for s in texts]
         for s in shots:
             s["state"] = "等待"
         self.cancel.clear()
@@ -870,7 +946,7 @@ class App:
             return
         n = int(sel[0])
         sid = self.result_rows[n]["shot_id"]
-        self.show_source(sid)
+        self.show_source(sid, self.result_rows[n]["data"].get("_loc"))
         if self.shot_tree.exists(str(sid)):
             self.shot_tree.selection_set(str(sid))
             self.shot_tree.see(str(sid))
@@ -907,20 +983,46 @@ class App:
             counts[k] = counts.get(k, 0) + 1
         return {k for k, v in counts.items() if v > 1}
 
-    def show_source(self, sid):
-        """在「截图」页和「识别结果」页同时显示来源截图的原图。"""
+    def show_source(self, sid, loc=None):
+        """在「截图」页和「识别结果」页同时显示来源截图（或文本原文）。
+        loc 为结果行的位置：图片框或文本行号范围，用来高亮；为 None 时不高亮。"""
         s = self.shot_by_id(sid) if sid is not None else None
         self.src_shot_id = sid
-        self._show_thumb(self.src_label, s, sid, (360, 420), "_photo_src")
-        self._show_thumb(self.src_label2, s, sid, (360, 260), "_photo_src2")
+        self._show_thumb(self.src_label, self.src_text, s, sid, (360, 420), "_photo_src", loc)
+        self._show_thumb(self.src_label2, self.src_text2, s, sid, (360, 260), "_photo_src2", loc)
 
-    def _show_thumb(self, label, s, sid, box, attr):
+    def _show_thumb(self, label, text_w, s, sid, box, attr, loc=None):
+        """右侧预览：图片记录显示缩略图（按 loc 画框）；文本记录显示原文（按 loc 高亮行）。"""
+        if s and s.get("text") is not None:
+            label.pack_forget()
+            text_w.pack(fill="both", expand=True)
+            text_w.config(state="normal")
+            text_w.delete("1.0", "end")
+            text_w.insert("1.0", s["text"])
+            text_w.tag_remove("hl", "1.0", "end")
+            if loc and loc[0] == "lines":
+                nlines = s["text"].count("\n") + 1
+                a, b = min(loc[1], nlines), min(loc[2], nlines)
+                text_w.tag_configure("hl", background="#ffe066")
+                text_w.tag_add("hl", f"{a}.0", f"{b}.end")
+                text_w.see(f"{a}.0")
+            text_w.config(state="disabled")
+            return
+        text_w.pack_forget()
+        label.pack(fill="both", expand=True)
         if not s:
             label.config(image="", text="选中截图或结果行查看原图" if sid is None else "来源截图已删除")
             return
         try:
             im = Image.open(s["path"])
             im.thumbnail(box)
+            if loc and loc[0] == "box":
+                im = im.convert("RGB")
+                w, h = im.size
+                x1, y1, x2, y2 = loc[1:]
+                ImageDraw.Draw(im).rectangle(
+                    [x1 * w / 1000, y1 * h / 1000, x2 * w / 1000, y2 * h / 1000],
+                    outline=(255, 40, 40), width=max(2, w // 120))
             # 必须保留 PhotoImage 的引用，否则会被垃圾回收而不显示
             setattr(self, attr, ImageTk.PhotoImage(im.convert("RGB")))
             label.config(image=getattr(self, attr), text="")
