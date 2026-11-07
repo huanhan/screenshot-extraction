@@ -61,29 +61,66 @@ def http_error_hint(code, body):
 
 
 def call_chat(settings, content):
-    """向 OpenAI 兼容接口发一次请求。content 为消息内容列表（文本或图片），返回模型输出的文字。"""
+    """向 OpenAI 兼容接口发一次流式请求。content 为消息内容列表（文本或图片），返回模型输出的完整文字。
+
+    流式输出时，REQUEST_TIMEOUT 是两次数据之间的最长空闲时间，而不是整次请求的时间，
+    只要模型还在持续输出，就不会因为总耗时长而超时。
+    """
     base, api_key = endpoint(settings)
     url = base.rstrip("/") + "/chat/completions"
-    body = {"model": settings["model"].strip(), "temperature": 0,
+    body = {"model": settings["model"].strip(), "temperature": 0, "stream": True,
             "messages": [{"role": "user", "content": content}]}
     req = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json",
+                 "Accept": "text/event-stream",
                  "Authorization": "Bearer " + api_key,
                  "User-Agent": BROWSER_UA})
+    parts = []
+    raw_lines = []                        # 非 SSE 格式（如接口直接返回的错误 JSON）时用于报错
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            for raw in resp:             # 逐行读取，每收到一行就处理，不等待整段输出
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                raw_lines.append(line)
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk_data = json.loads(payload)
+                except ValueError:
+                    continue
+                if "error" in chunk_data:
+                    raise RuntimeError("接口返回错误：" + str(chunk_data["error"])[:300])
+                try:
+                    delta = chunk_data["choices"][0].get("delta") or {}
+                except (KeyError, IndexError, TypeError, AttributeError):
+                    continue
+                piece = delta.get("content")
+                if piece:
+                    parts.append(piece)
     except urllib.error.HTTPError as e:
         raise RuntimeError(http_error_hint(e.code, e.read().decode("utf-8", "replace")))
     except urllib.error.URLError as e:
         raise RuntimeError(f"网络请求失败：{e.reason}")
     except TimeoutError:
-        raise RuntimeError(f"请求超过 {REQUEST_TIMEOUT} 秒没有响应")
-    try:
-        return data["choices"][0]["message"]["content"] or ""
-    except (KeyError, IndexError, TypeError):
-        raise RuntimeError("接口返回格式不认识：" + str(data)[:300])
+        raise RuntimeError(f"数据已停止输出超过 {REQUEST_TIMEOUT} 秒")
+    except OSError as e:                  # 流式读取中途断开等
+        raise RuntimeError(f"网络请求中断：{e}")
+    if not parts:
+        if raw_lines:
+            # 接口没有按流式返回，而是一次性返回了普通 JSON（choices[0].message.content）
+            try:
+                data = json.loads("".join(raw_lines))
+                return data["choices"][0]["message"]["content"] or ""
+            except (ValueError, KeyError, IndexError, TypeError):
+                raise RuntimeError("接口返回格式不认识：" + " ".join(raw_lines)[:300])
+        raise RuntimeError("接口没有返回内容")
+    return "".join(parts)
 
 
 def call_vision_model(settings, images_b64):
