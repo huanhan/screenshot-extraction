@@ -17,7 +17,7 @@ AUTO_INTERVAL_SEC = 60     # 自动识别：有待处理截图时，每隔这么
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-CGW_SITE = "https://img.cgwimg.com"          # cgwimg 站点（授权页与接口都在这里）
+CGW_SITE = "https://cgwimg.com"              # cgwimg 站点（授权页与接口都在这里）
 CGW_BASE_URL = CGW_SITE + "/api/v1"          # OpenAI 兼容接口地址
 CGW_APP_ID = "screenshot-extraction"         # 在 cgwimg 后台登记的应用 ID
 CGW_MODEL = "gpt-6.1-sol"                    # cgwimg 方式固定使用的模型
